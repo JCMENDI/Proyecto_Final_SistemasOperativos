@@ -1,0 +1,15 @@
+[Unit]
+Description=Tienda SO-2026 FastAPI
+After=network.target
+
+[Service]
+User=urlos
+WorkingDirectory=/opt/tienda
+ExecStart=/opt/tienda/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/tienda/app.log
+StandardError=append:/var/log/tienda/app.log
+
+[Install]
+WantedBy=multi-user.target
