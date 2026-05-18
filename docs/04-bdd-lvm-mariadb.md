@@ -1,100 +1,259 @@
-# 04 — Servidor BDD: RAID-1, LVM y MariaDB
+# 04 — Servidor de Base de Datos: RAID-1, LVM y MariaDB
 
-> **Estado:** Diseño completado · Implementación pendiente
-> **Responsable:** José (con revisión de Luis)
+**Responsable:** José  
+**VM:** `bdd-server`  
+**IP temporal (casa):** 192.168.0.20  
+**IP definitiva (switch):** 192.168.8.20  
+**OS:** Ubuntu Server 24.04 LTS  
 
-## Topología de discos
+---
 
-`bdd-server` se aprovisiona con cuatro discos virtuales independientes,
-agregados en VMware Workstation:
+## 1. Objetivo
 
-| Dispositivo | Tamaño | Rol |
+Configurar un servidor de base de datos con alta disponibilidad a nivel de almacenamiento, usando:
+- **RAID-1** con `mdadm` para tolerancia a fallos de disco.
+- **LVM** sobre el RAID para gestión flexible de volúmenes.
+- **MariaDB** con el directorio de datos (`datadir`) en el volumen LVM.
+
+---
+
+## 2. Verificación de discos
+
+Antes de comenzar se verificaron los discos disponibles en la VM:
+
+```bash
+lsblk
+```
+
+**Resultado:**
+
+| Dispositivo | Tamaño | Uso |
 |---|---|---|
-| `/dev/sda` | 20 GB | Sistema operativo Ubuntu (raíz, swap) |
-| `/dev/sdb` | 10 GB | Miembro del RAID-1 para datos de MariaDB |
-| `/dev/sdc` | 10 GB | Miembro del RAID-1 para datos de MariaDB |
-| `/dev/sdd` | 10 GB | Disco separado para backups, montado en `/mnt/backups` |
+| `sda` | 25 GB | Disco del sistema (Ubuntu) |
+| `sdb` | 1 GB | Disco para RAID-1 |
+| `sdc` | 1 GB | Disco para RAID-1 |
+| `sdd` | 1 GB | Disco auxiliar (no usado en el proyecto) |
 
-El disco de backups es **independiente** del par RAID-1 para cumplir el
-requisito del enunciado: "el backup se traslada hacia otro disco distinto al
-usado para alojar los archivos de datos".
+---
 
-## Diseño de RAID + LVM
+## 3. Configuración de RAID-1
 
-Sobre los dos discos del par se construye un arreglo **RAID-1** mediante
-`mdadm`, expuesto como `/dev/md0`. Encima de `/dev/md0` se construye una
-pila LVM:
+### 3.1 Verificación del estado del RAID
 
-- **Physical Volume:** `/dev/md0`.
-- **Volume Group:** `vg-data` (incorpora únicamente este PV).
-- **Logical Volume:** `lv-mysql` (consume todo el espacio disponible del VG).
-- **Filesystem:** `ext4` con etiqueta `mysql-data`.
-- **Mount point:** `/mnt/db-data`.
-- **Datadir final de MariaDB:** `/mnt/db-data/mysql`.
+El RAID-1 (`md127`) ya estaba creado sobre `sdb` y `sdc`. Se verificó su estado:
 
-La entrada en `/etc/fstab` usa la `UUID` del filesystem (no el path del LV)
-para sobrevivir reordenamientos de discos.
+```bash
+cat /proc/mdstat
+```
 
-## Decisiones de diseño y justificación
+**Salida esperada:**
+```
+md127 : active raid1 sdc[1] sdb[0]
+      1046528 blocks super 1.2 [2/2] [UU]
+```
 
-- **RAID-1 sobre RAID-0 o RAID-5:** el enunciado pide "grupo de volumen con
-  al menos 2 discos"; la redundancia (objetivo del proyecto) la cumple
-  RAID-1. RAID-0 no da redundancia; RAID-5 requiere mínimo 3 discos y
-  agrega complejidad innecesaria.
-- **`mdadm` en vez de LVM mirror:** `mdadm` es la implementación de RAID
-  más común en Linux, mejor documentada y desacoplada de LVM. Permite
-  reconstruir un disco sin afectar la capa LVM por encima.
-- **LVM encima del RAID (y no a la inversa):** el RAID protege contra falla
-  de disco a nivel de bloque; LVM permite redimensionar el filesystem en
-  caliente si crece la BDD. El orden correcto es `discos → mdadm → LVM →
-  filesystem`.
-- **Datadir movido a `/mnt/db-data/mysql`:** los paquetes de MariaDB lo
-  colocan por defecto en `/var/lib/mysql`, que vive en el disco del SO. Se
-  reubica para que TODOS los archivos de datos residan sobre el volumen
-  protegido por RAID, no solo lógicamente referenciados desde ahí.
+El estado `[UU]` indica que ambos discos están activos y sincronizados.
 
-## Esquema de la base de datos `tienda`
+### 3.2 Desmontaje del filesystem directo
 
-Cuatro tablas, definidas por el ORM de la aplicación:
+El RAID tenía un filesystem ext4 montado directamente en `/mnt/raid1`. Se desmontó para poder crear LVM encima:
 
-| Tabla | Propósito | PK |
+```bash
+sudo umount /mnt/raid1
+sudo wipefs -a /dev/md127
+```
+
+---
+
+## 4. Configuración de LVM sobre RAID-1
+
+### 4.1 Crear Physical Volume
+
+```bash
+sudo pvcreate /dev/md127
+```
+
+**Salida esperada:**
+```
+Physical volume "/dev/md127" successfully created.
+```
+
+### 4.2 Crear Volume Group
+
+```bash
+sudo vgcreate vg-db /dev/md127
+```
+
+**Salida esperada:**
+```
+Volume group "vg-db" successfully created
+```
+
+### 4.3 Crear Logical Volume
+
+```bash
+sudo lvcreate -n db-data -l 100%FREE vg-db
+```
+
+**Salida esperada:**
+```
+Logical volume "db-data" created.
+```
+
+### 4.4 Formatear y montar
+
+```bash
+sudo mkfs.ext4 /dev/vg-db/db-data
+sudo mkdir -p /mnt/db-data
+sudo mount /dev/vg-db/db-data /mnt/db-data
+```
+
+### 4.5 Persistencia en fstab
+
+Se obtuvo el UUID del volumen:
+
+```bash
+sudo blkid /dev/vg-db/db-data
+```
+
+Se agregó la entrada al `/etc/fstab`:
+
+```bash
+echo 'UUID=05b957f9-91a9-4cb3-baab-a6bdfcae4ff0 /mnt/db-data ext4 defaults 0 2' | sudo tee -a /etc/fstab
+```
+
+Se removieron entradas antiguas de `/mnt/raid1` y `/mnt/vol1`:
+
+```bash
+sudo sed -i '/mnt\/raid1/d' /etc/fstab
+sudo sed -i '/mnt\/vol1/d' /etc/fstab
+sudo mount -a
+```
+
+### 4.6 Verificación final de almacenamiento
+
+```bash
+lsblk
+df -h /mnt/db-data
+```
+
+**Resultado:**
+```
+/dev/mapper/vg--db--db-data   986M   24K  919M   1%  /mnt/db-data
+```
+
+---
+
+## 5. Instalación y configuración de MariaDB
+
+### 5.1 Instalación
+
+MariaDB 10.11 ya estaba instalada en la VM. Se verificó:
+
+```bash
+sudo systemctl status mariadb --no-pager
+```
+
+### 5.2 Mover el datadir al volumen LVM
+
+Se detuvo MariaDB y se copiaron los datos al nuevo destino:
+
+```bash
+sudo systemctl stop mariadb
+sudo mkdir -p /mnt/db-data/mysql
+sudo rsync -av /var/lib/mysql/ /mnt/db-data/mysql/
+sudo chown -R mysql:mysql /mnt/db-data/mysql
+```
+
+Se actualizó la configuración en `/etc/mysql/mariadb.conf.d/50-server.cnf`:
+
+```ini
+datadir = /mnt/db-data/mysql
+bind-address = 0.0.0.0
+```
+
+Se reinició MariaDB:
+
+```bash
+sudo systemctl start mariadb
+sudo systemctl status mariadb --no-pager
+```
+
+**Verificación en logs:**
+```
+InnoDB: Loading buffer pool(s) from /mnt/db-data/mysql/ib_buffer_pool
+```
+
+### 5.3 Asegurar la instalación
+
+```bash
+sudo mysql_secure_installation
+```
+
+Opciones aplicadas:
+- No cambiar autenticación unix_socket
+- No cambiar contraseña root
+- Eliminar usuarios anónimos ✓
+- Deshabilitar login root remoto ✓
+- Eliminar base de datos `test` ✓
+- Recargar tabla de privilegios ✓
+
+---
+
+## 6. Creación de base de datos y usuarios
+
+```sql
+CREATE DATABASE tienda CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+CREATE USER 'tienda_app'@'192.168.8.21' IDENTIFIED BY 'tienda_pass_2026';
+GRANT ALL PRIVILEGES ON tienda.* TO 'tienda_app'@'192.168.8.21';
+
+CREATE USER 'backup'@'localhost' IDENTIFIED BY 'backup_pass_2026';
+GRANT SELECT, LOCK TABLES ON tienda.* TO 'backup'@'localhost';
+
+FLUSH PRIVILEGES;
+```
+
+**Verificación:**
+
+```sql
+SHOW DATABASES;
+SELECT User, Host FROM mysql.user;
+```
+
+| User | Host |
+|---|---|
+| `tienda_app` | `192.168.8.21` |
+| `backup` | `localhost` |
+| `root` | `localhost` |
+
+---
+
+## 7. Configuración de UFW
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow ssh
+sudo ufw allow from 192.168.8.21 to any port 3306
+sudo ufw enable
+```
+
+**Reglas activas:**
+
+| Puerto | Acción | Desde |
 |---|---|---|
-| `products` | Catálogo (SKU, nombre, precio, stock) | `id` |
-| `carts` | Carritos abiertos por usuario | `id` |
-| `cart_items` | Líneas de carrito (producto + cantidad) | `id`, FK a `carts` y `products` |
-| `orders` | Transacciones completadas (exitosas y fallidas, con `error_reason`) | `id`, `transaction_id` único |
+| 22/tcp | ALLOW | Anywhere |
+| 3306 | ALLOW | 192.168.8.21 |
 
-Las órdenes fallidas también se persisten (no solo se loguean) para que
-exista una fuente de verdad en BDD además del índice de Elasticsearch.
+---
 
-## Usuarios de la BDD
+## 8. Verificación final
 
-| Usuario | Host de origen | Privilegios | Uso |
-|---|---|---|---|
-| `root` | `localhost` | Todos | Administración manual |
-| `tienda_app` | `192.168.8.21` (app-server) | `SELECT, INSERT, UPDATE, DELETE` sobre `tienda.*` | Conexión desde FastAPI |
-| `backup` | `localhost` | `SELECT, LOCK TABLES, PROCESS, RELOAD, SHOW VIEW, TRIGGER` | Ejecución de `mariadb-dump` |
-
-Los privilegios de `tienda_app` excluyen `DROP`, `ALTER`, `CREATE` y
-`GRANT` para limitar el impacto de un compromiso de la aplicación.
-
-## Configuración relevante de MariaDB
-
-Vive en `/etc/mysql/mariadb.conf.d/50-server.cnf` (versión completa en
-`config/mariadb/50-server.cnf`). Los puntos clave:
-
-- `datadir = /mnt/db-data/mysql`
-- `bind-address = 0.0.0.0` (filtrado por UFW para que solo `app-server`
-  llegue al puerto 3306).
-- `innodb_buffer_pool_size = 256M` (ajustado a 1.5 GB de RAM de la VM).
-- AppArmor: ajuste de perfil `/etc/apparmor.d/local/usr.sbin.mysqld` para
-  autorizar lectura/escritura sobre el nuevo datadir.
-
-## Por completar tras implementación
-
-- [ ] Salida de `lsblk` mostrando los 4 discos.
-- [ ] Salida de `mdadm --detail /dev/md0` con `State: clean`.
-- [ ] Salidas de `pvs`, `vgs`, `lvs`.
-- [ ] Salida de `df -h /mnt/db-data` y `df -h /mnt/backups`.
-- [ ] Salida de `SHOW DATABASES` y `SHOW TABLES FROM tienda`.
-- [ ] Captura de conexión exitosa desde `app-server` con `mariadb -h ...`.
+```bash
+sudo systemctl status mariadb --no-pager
+sudo ufw status verbose
+lsblk
+cat /proc/mdstat
+sudo pvs && sudo vgs && sudo lvs
+```
